@@ -76,30 +76,34 @@ def ocr_imagem(caminho):
 
 
 def parsear_campos_regex(texto):
+    """Fallback: extrai campos por regex quando a IA falha."""
     resultado = {"nome": None, "grupo_cota": None, "modelo": None, "cor": None}
 
-    cota = re.search(r'\b(\d{3,5}-\d{2,3}-\d-\d)\b', texto)
+    # Grupo/Cota: padrão NNNNN-NNN-N-N no topo do documento
+    cota = re.search(r'\b(\d{4,5}-\d{2,3}-\d-\d)\b', texto)
     if cota:
         resultado["grupo_cota"] = cota.group(1)
 
+    # Nome completo logo após "Nome Completo"
     nome = re.search(
-        r'(?:Nome\s+Completo|Nome)[:\s]+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ][A-Za-záéíóúâêîôûãõàèìòùçÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ\s]{5,70}?)(?:\s{2,}|\n|CPF|Data|Tipo|Grupo)',
+        r'Nome\s+Completo[:\s]+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ][A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇa-záéíóúâêîôûãõàèìòùç\s]{5,70}?)(?:\s{2,}|\n|CPF|Data|Tipo)',
         texto, re.IGNORECASE
     )
     if nome:
-        n = nome.group(1).strip().replace('\n', ' ')
-        n = re.sub(r'\s+', ' ', n)
+        n = re.sub(r'\s+', ' ', nome.group(1)).strip()
         if len(n.split()) >= 2:
             resultado["nome"] = n
 
-    modelos = ['CG', 'NXR', 'BIZ', 'PCX', 'CB ', 'XRE', 'LEAD', 'POP', 'FAN', 'BROS', 'TWISTER', 'START', 'SHINE', 'TITAN', 'DREAM']
+    # Modelo — procura padrões Honda comuns
+    modelos = ['CG 160','CG160','NXR','BIZ','PCX','CB 300','CB300','XRE','LEAD','POP','FAN','BROS','TWISTER','TITAN','DREAM','CB 500','START','SHINE']
     for mod in modelos:
-        m = re.search(rf'{mod}[\s\w]{{0,30}}', texto, re.IGNORECASE)
+        m = re.search(rf'{re.escape(mod)}[\s\w]{{0,20}}', texto, re.IGNORECASE)
         if m:
-            resultado["modelo"] = m.group(0).strip().rstrip('.,;')
+            resultado["modelo"] = re.sub(r'\s+', ' ', m.group(0)).strip().rstrip('.,;')
             break
 
-    cores = ['BRANCA?', 'PRETA?', 'VERMELH[AO]', 'AZUL', 'PRATA', 'CINZA', 'AMARELA?', 'VERDE', 'LARANJA', 'VINHO', 'GRAFITE']
+    # Cor
+    cores = ['BRANCA?','PRETA?','VERMELH[AO]','AZUL','PRATA','CINZA','AMARELA?','VERDE','LARANJA','VINHO','GRAFITE','MARROM']
     cor = re.search(r'\b(' + '|'.join(cores) + r')\b', texto, re.IGNORECASE)
     if cor:
         resultado["cor"] = cor.group(1).upper()
@@ -121,13 +125,23 @@ def extrair_com_gemini(caminho, ext):
 
     mime = 'application/pdf' if ext == '.pdf' else f'image/{ext.lstrip(".")}'
 
-    prompt = """Analise este documento de consórcio de moto e extraia os dados abaixo.
-Retorne SOMENTE um JSON válido, sem texto adicional, sem markdown, sem explicações.
-Formato exato:
-{"nome": "NOME COMPLETO DO CLIENTE", "grupo_cota": "XXXX-XXX-X-X", "modelo": "MODELO DA MOTO", "cor": "COR DA MOTO"}
+    # Prompt detalhado baseado no formato real do documento Honda
+    prompt = """Este é um documento "CADASTRO DE PESSOA FÍSICA - CONSORCIADO" da Honda Consórcio.
 
-Se algum campo não for encontrado, use null.
-Não inclua nada além do JSON."""
+Extraia EXATAMENTE os seguintes campos:
+
+1. "nome": O nome completo do consorciado. Está no campo "Nome Completo:" na seção INFORMAÇÕES PESSOAIS. Exemplo: "LORRAYNE DRIELLY CAMPOS MARTINS"
+
+2. "grupo_cota": O código do grupo/cota. Está logo abaixo do título "CADASTRO DE PESSOA FÍSICA - CONSORCIADO", no formato NNNNN-NNN-N-N. Exemplo: "43460-563-0-0"
+
+3. "modelo": O modelo da moto. Está na tabela "TERMO DE COMPROMISSO" na coluna "Modelo". Também pode aparecer no campo "Bem base plano" com asterisco. Exemplo: "CG 160 TITAN S"
+
+4. "cor": A cor da moto. Está na tabela "TERMO DE COMPROMISSO" na coluna "Cor". Exemplo: "BRANCA"
+
+Retorne SOMENTE este JSON, sem texto antes ou depois, sem markdown:
+{"nome": "...", "grupo_cota": "...", "modelo": "...", "cor": "..."}
+
+Se algum campo não for encontrado, use null."""
 
     resposta = model.generate_content([
         {
@@ -140,7 +154,12 @@ Não inclua nada além do JSON."""
     ])
 
     txt = resposta.text.strip()
+    print(f"[Gemini raw] {txt}")
+
+    # Remove possíveis marcações de markdown
     txt = re.sub(r'```(?:json)?', '', txt).strip().rstrip('`').strip()
+
+    # Extrai apenas o objeto JSON
     match = re.search(r'\{.*\}', txt, re.DOTALL)
     if match:
         txt = match.group(0)
@@ -155,7 +174,7 @@ def health():
     return jsonify({
         "status": "ok",
         "gemini_key_configurada": bool(api_key),
-        "versao": "2.0"
+        "versao": "3.0"
     })
 
 
@@ -180,23 +199,26 @@ def extrair():
     metodo = "gemini"
 
     try:
+        # Tenta com Gemini (IA)
         resultado = extrair_com_gemini(caminho, ext)
-        print(f"[Gemini] Extração OK: {resultado}")
+        print(f"[Gemini OK] {resultado}")
 
     except ValueError as ve:
-        print(f"[Gemini] {ve} — usando fallback regex")
+        # Chave não configurada
+        print(f"[Gemini] {ve} — fallback regex")
         metodo = "regex"
         texto = extrair_texto_pdf(str(caminho)) if ext == '.pdf' else ocr_imagem(str(caminho))
         resultado = parsear_campos_regex(texto)
 
     except json.JSONDecodeError as je:
-        print(f"[Gemini] JSON inválido: {je} — usando fallback regex")
+        # Gemini retornou JSON malformado — tenta regex
+        print(f"[Gemini] JSON inválido: {je} — fallback regex")
         metodo = "regex"
         texto = extrair_texto_pdf(str(caminho)) if ext == '.pdf' else ocr_imagem(str(caminho))
         resultado = parsear_campos_regex(texto)
 
     except Exception as e:
-        print(f"[Gemini] Erro: {e} — usando fallback regex")
+        print(f"[Gemini] Erro: {type(e).__name__}: {e} — fallback regex")
         metodo = "regex"
         try:
             texto = extrair_texto_pdf(str(caminho)) if ext == '.pdf' else ocr_imagem(str(caminho))
@@ -209,7 +231,13 @@ def extrair():
         if caminho.exists():
             caminho.unlink()
 
+    # Limpa valores "null" string
+    for k in resultado:
+        if resultado[k] in (None, 'null', 'None', ''):
+            resultado[k] = None
+
     resultado["_metodo"] = metodo
+    print(f"[Resultado final] metodo={metodo} dados={resultado}")
     return jsonify(resultado)
 
 
