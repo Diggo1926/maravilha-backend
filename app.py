@@ -4,7 +4,8 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
-
+import google.generativeai as genai
+import base64   
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pdfplumber
@@ -119,26 +120,33 @@ def extrair():
     arquivo.save(str(caminho))
 
     try:
-        if ext == '.pdf':
-            texto = extrair_texto_pdf(str(caminho))
-        elif ext in ('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.webp'):
-            texto = ocr_imagem(str(caminho))
-        else:
-            return jsonify({"erro": f"Formato não suportado: {ext}"}), 400
+        genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
-        if not texto.strip():
-            return jsonify({"erro": "Não foi possível extrair texto"}), 422
+        with open(caminho, 'rb') as f:
+            dados_arquivo = f.read()
 
-        campos = parsear_campos(texto)
-        return jsonify(campos)
+        mime = 'application/pdf' if ext == '.pdf' else f'image/{ext[1:]}'
+
+        resposta = model.generate_content([
+            {
+                "inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(dados_arquivo).decode()
+                }
+            },
+            """Extraia os dados deste documento de consórcio Honda e retorne APENAS JSON válido sem markdown:
+{"nome": "nome completo", "grupo_cota": "código no formato NNNN-NNN-N-N", "modelo": "modelo da moto", "cor": "cor da moto"}"""
+        ])
+
+        txt = resposta.text.strip().replace('```json','').replace('```','').strip()
+        return jsonify(json.loads(txt))
 
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
     finally:
         if caminho.exists():
             caminho.unlink()
-
-
 @app.route('/clientes', methods=['GET'])
 def listar_clientes():
     return jsonify(carregar_clientes())
