@@ -194,6 +194,11 @@ def parsear_campos_regex(texto):
             resultado["modelo"] = re.sub(r'\s+', ' ', m.group(0)).strip().rstrip('.,;')
             break
 
+    if resultado["modelo"]:
+        modelo = re.sub(r'\s+\d+[\.,]?\d*\s*%?$', '', resultado["modelo"]).strip()
+        modelo = re.sub(r'\s+[A-Z]$', '', modelo).strip()
+        resultado["modelo"] = modelo
+
     # Cor
     cores = ['BRANCA?','PRETA?','VERMELH[AO]','AZUL','PRATA','CINZA','AMARELA?','VERDE','LARANJA','VINHO','GRAFITE','MARROM']
     cor = re.search(r'\b(' + '|'.join(cores) + r')\b', texto, re.IGNORECASE)
