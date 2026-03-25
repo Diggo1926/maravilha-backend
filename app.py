@@ -22,9 +22,100 @@ DATA_FILE  = BASE_DIR / "clientes.json"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# ─── BANCO DE DADOS ─────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_usar_postgres = bool(DATABASE_URL)
+
+
+def _get_conn():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _init_db():
+    if not _usar_postgres:
+        return
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clientes (
+                id TEXT PRIMARY KEY,
+                nome TEXT,
+                grupo_cota TEXT,
+                modelo TEXT,
+                cor TEXT,
+                status TEXT,
+                data_entrada TEXT,
+                data_contemplacao TEXT,
+                criado_em TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS historico (
+                id SERIAL PRIMARY KEY,
+                cliente_id TEXT,
+                acao TEXT,
+                dados_anteriores TEXT,
+                dados_novos TEXT,
+                data_hora TEXT
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[DB] Tabelas inicializadas.")
+    except Exception as e:
+        print(f"[DB] Erro ao inicializar tabelas: {e}")
+
+
+_init_db()
+
+
+def _row_to_dict(row):
+    return {
+        "id":                row[0],
+        "nome":              row[1],
+        "grupo_cota":        row[2],
+        "modelo":            row[3],
+        "cor":               row[4],
+        "status":            row[5],
+        "data_entrada":      row[6],
+        "data_contemplacao": row[7],
+        "criado_em":         row[8],
+    }
+
+
+def _registrar_historico(conn, cliente_id, acao, dados_anteriores=None, dados_novos=None):
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO historico (cliente_id, acao, dados_anteriores, dados_novos, data_hora) VALUES (%s, %s, %s, %s, %s)",
+        (
+            cliente_id,
+            acao,
+            json.dumps(dados_anteriores, ensure_ascii=False) if dados_anteriores else None,
+            json.dumps(dados_novos, ensure_ascii=False) if dados_novos else None,
+            datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        )
+    )
+    cur.close()
+
 
 # ─── PERSISTÊNCIA ───────────────────────────────────────────
 def carregar_clientes():
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes ORDER BY criado_em DESC")
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return [_row_to_dict(r) for r in rows]
+        except Exception as e:
+            print(f"[DB] Erro ao carregar clientes: {e}")
+            return []
+    # Fallback JSON
     if DATA_FILE.exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -32,6 +123,7 @@ def carregar_clientes():
 
 
 def salvar_clientes(clientes):
+    """Mantida apenas para fallback JSON."""
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(clientes, f, ensure_ascii=False, indent=2)
 
@@ -174,7 +266,8 @@ def health():
     return jsonify({
         "status": "ok",
         "gemini_key_configurada": bool(api_key),
-        "versao": "3.0"
+        "banco": "postgres" if _usar_postgres else "json",
+        "versao": "4.0"
     })
 
 
@@ -253,7 +346,6 @@ def adicionar_cliente():
     if not dados:
         return jsonify({"erro": "Corpo da requisição inválido"}), 400
 
-    clientes = carregar_clientes()
     cliente = {
         "id":                str(uuid.uuid4()),
         "nome":              dados.get("nome", "—"),
@@ -265,8 +357,44 @@ def adicionar_cliente():
         "data_contemplacao": dados.get("data_contemplacao", "—"),
         "criado_em":         datetime.now().strftime("%d/%m/%Y"),
     }
-    clientes.insert(0, cliente)
-    salvar_clientes(clientes)
+
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+
+            # Validação de duplicata por grupo_cota
+            gc = cliente["grupo_cota"]
+            if gc and gc != "—":
+                cur.execute("SELECT id FROM clientes WHERE grupo_cota = %s", (gc,))
+                if cur.fetchone():
+                    cur.close()
+                    conn.close()
+                    return jsonify({"erro": "Cliente com este Grupo/Cota já está cadastrado", "duplicado": True}), 409
+
+            cur.execute(
+                "INSERT INTO clientes (id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (cliente["id"], cliente["nome"], cliente["grupo_cota"], cliente["modelo"],
+                 cliente["cor"], cliente["status"], cliente["data_entrada"],
+                 cliente["data_contemplacao"], cliente["criado_em"])
+            )
+            _registrar_historico(conn, cliente["id"], "ADICIONADO", dados_novos=cliente)
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[DB] Erro ao adicionar cliente: {e}")
+            return jsonify({"erro": "Erro interno ao salvar cliente"}), 500
+    else:
+        # Fallback JSON
+        clientes = carregar_clientes()
+        gc = cliente["grupo_cota"]
+        if gc and gc != "—":
+            if any(c.get("grupo_cota") == gc for c in clientes):
+                return jsonify({"erro": "Cliente com este Grupo/Cota já está cadastrado", "duplicado": True}), 409
+        clientes.insert(0, cliente)
+        salvar_clientes(clientes)
+
     return jsonify(cliente), 201
 
 
@@ -276,22 +404,101 @@ def editar_cliente(id):
     if not dados:
         return jsonify({"erro": "Corpo da requisição inválido"}), 400
 
-    clientes = carregar_clientes()
-    for c in clientes:
-        if c["id"] == id:
-            for k, v in dados.items():
-                if k != "id":
-                    c[k] = v
-            break
-    salvar_clientes(clientes)
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+
+            # Busca estado anterior para histórico
+            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            row = cur.fetchone()
+            anterior = _row_to_dict(row) if row else None
+
+            campos = {k: v for k, v in dados.items() if k != "id"}
+            if campos:
+                sets = ", ".join(f"{k} = %s" for k in campos)
+                valores = list(campos.values()) + [id]
+                cur.execute(f"UPDATE clientes SET {sets} WHERE id = %s", valores)
+
+            # Busca estado novo para histórico
+            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            row_novo = cur.fetchone()
+            novo = _row_to_dict(row_novo) if row_novo else None
+
+            _registrar_historico(conn, id, "EDITADO", dados_anteriores=anterior, dados_novos=novo)
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[DB] Erro ao editar cliente: {e}")
+            return jsonify({"erro": "Erro interno ao editar cliente"}), 500
+    else:
+        clientes = carregar_clientes()
+        for c in clientes:
+            if c["id"] == id:
+                for k, v in dados.items():
+                    if k != "id":
+                        c[k] = v
+                break
+        salvar_clientes(clientes)
+
     return jsonify({"ok": True})
 
 
 @app.route('/clientes/<id>', methods=['DELETE'])
 def remover_cliente(id):
-    clientes = [c for c in carregar_clientes() if c["id"] != id]
-    salvar_clientes(clientes)
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+
+            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            row = cur.fetchone()
+            anterior = _row_to_dict(row) if row else None
+
+            cur.execute("DELETE FROM clientes WHERE id = %s", (id,))
+            _registrar_historico(conn, id, "REMOVIDO", dados_anteriores=anterior)
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[DB] Erro ao remover cliente: {e}")
+            return jsonify({"erro": "Erro interno ao remover cliente"}), 500
+    else:
+        clientes = [c for c in carregar_clientes() if c["id"] != id]
+        salvar_clientes(clientes)
+
     return jsonify({"ok": True})
+
+
+# ─── HISTÓRICO ──────────────────────────────────────────────
+@app.route('/historico', methods=['GET'])
+def listar_historico():
+    if not _usar_postgres:
+        return jsonify([])
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, cliente_id, acao, dados_anteriores, dados_novos, data_hora FROM historico ORDER BY id DESC LIMIT 50"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        resultado = []
+        for r in rows:
+            resultado.append({
+                "id":               r[0],
+                "cliente_id":       r[1],
+                "acao":             r[2],
+                "dados_anteriores": json.loads(r[3]) if r[3] else None,
+                "dados_novos":      json.loads(r[4]) if r[4] else None,
+                "data_hora":        r[5],
+            })
+        return jsonify(resultado)
+    except Exception as e:
+        print(f"[DB] Erro ao carregar histórico: {e}")
+        return jsonify({"erro": "Erro ao carregar histórico"}), 500
 
 
 if __name__ == '__main__':
