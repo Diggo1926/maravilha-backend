@@ -18,7 +18,8 @@ CORS(app)
 
 BASE_DIR   = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
-DATA_FILE  = BASE_DIR / "clientes.json"
+DATA_FILE    = BASE_DIR / "clientes.json"
+ESTOQUE_FILE = BASE_DIR / "estoque.json"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -504,6 +505,72 @@ def listar_historico():
     except Exception as e:
         print(f"[DB] Erro ao carregar histórico: {e}")
         return jsonify({"erro": "Erro ao carregar histórico"}), 500
+
+
+# ─── ESTOQUE ────────────────────────────────────────────────
+@app.route('/estoque', methods=['GET'])
+def get_estoque():
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS estoque (
+                    id INTEGER DEFAULT 1,
+                    dados TEXT,
+                    PRIMARY KEY (id)
+                )
+            """)
+            conn.commit()
+            cur.execute("SELECT dados FROM estoque WHERE id = 1")
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            return jsonify(json.loads(row[0]) if row else {})
+        except Exception as e:
+            print(f"[DB] Erro ao carregar estoque: {e}")
+            return jsonify({"erro": "Erro ao carregar estoque"}), 500
+    else:
+        if ESTOQUE_FILE.exists():
+            with open(ESTOQUE_FILE, "r", encoding="utf-8") as f:
+                return jsonify(json.load(f))
+        return jsonify({})
+
+
+@app.route('/estoque', methods=['POST'])
+def save_estoque():
+    dados = request.get_json()
+    if not dados or "estoque" not in dados:
+        return jsonify({"erro": "Corpo inválido, esperado {\"estoque\": {...}}"}), 400
+
+    estoque = dados["estoque"]
+
+    if _usar_postgres:
+        try:
+            conn = _get_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS estoque (
+                    id INTEGER DEFAULT 1,
+                    dados TEXT,
+                    PRIMARY KEY (id)
+                )
+            """)
+            cur.execute(
+                "INSERT INTO estoque (id, dados) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET dados = EXCLUDED.dados",
+                (json.dumps(estoque, ensure_ascii=False),)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[DB] Erro ao salvar estoque: {e}")
+            return jsonify({"erro": "Erro ao salvar estoque"}), 500
+    else:
+        with open(ESTOQUE_FILE, "w", encoding="utf-8") as f:
+            json.dump(estoque, f, ensure_ascii=False, indent=2)
+
+    return jsonify({"ok": True})
 
 
 if __name__ == '__main__':
