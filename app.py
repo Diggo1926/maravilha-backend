@@ -16,14 +16,16 @@ import pytesseract
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR   = Path(__file__).parent
+BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
-DATA_FILE    = BASE_DIR / "clientes.json"
+DATA_FILE = BASE_DIR / "clientes.json"
 ESTOQUE_FILE = BASE_DIR / "estoque.json"
-
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ─── BANCO DE DADOS ─────────────────────────────────────────
+# Campos permitidos para edição de clientes (evita injeção de campos arbitrários)
+CAMPOS_PERMITIDOS = {"nome", "grupo_cota", "modelo", "cor", "status", "data_entrada", "data_contemplacao"}
+
+# ─── BANCO DE DADOS ───────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 _usar_postgres = bool(DATABASE_URL)
 
@@ -62,6 +64,13 @@ def _init_db():
                 data_hora TEXT
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS estoque (
+                id INTEGER DEFAULT 1,
+                dados TEXT,
+                PRIMARY KEY (id)
+            )
+        """)
         conn.commit()
         cur.close()
         conn.close()
@@ -75,15 +84,15 @@ _init_db()
 
 def _row_to_dict(row):
     return {
-        "id":                row[0],
-        "nome":              row[1],
-        "grupo_cota":        row[2],
-        "modelo":            row[3],
-        "cor":               row[4],
-        "status":            row[5],
-        "data_entrada":      row[6],
+        "id": row[0],
+        "nome": row[1],
+        "grupo_cota": row[2],
+        "modelo": row[3],
+        "cor": row[4],
+        "status": row[5],
+        "data_entrada": row[6],
         "data_contemplacao": row[7],
-        "criado_em":         row[8],
+        "criado_em": row[8],
     }
 
 
@@ -97,18 +106,20 @@ def _registrar_historico(conn, cliente_id, acao, dados_anteriores=None, dados_no
             json.dumps(dados_anteriores, ensure_ascii=False) if dados_anteriores else None,
             json.dumps(dados_novos, ensure_ascii=False) if dados_novos else None,
             datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        )
+        ),
     )
     cur.close()
 
 
-# ─── PERSISTÊNCIA ───────────────────────────────────────────
+# ─── PERSISTÊNCIA ─────────────────────────────────────────────────────────────
 def carregar_clientes():
     if _usar_postgres:
         try:
             conn = _get_conn()
             cur = conn.cursor()
-            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes ORDER BY criado_em DESC")
+            cur.execute(
+                "SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes ORDER BY criado_em DESC"
+            )
             rows = cur.fetchall()
             cur.close()
             conn.close()
@@ -116,7 +127,6 @@ def carregar_clientes():
         except Exception as e:
             print(f"[DB] Erro ao carregar clientes: {e}")
             return []
-    # Fallback JSON
     if DATA_FILE.exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -129,7 +139,7 @@ def salvar_clientes(clientes):
         json.dump(clientes, f, ensure_ascii=False, indent=2)
 
 
-# ─── EXTRAÇÃO DE TEXTO (fallback sem IA) ────────────────────
+# ─── EXTRAÇÃO DE TEXTO (fallback sem IA) ──────────────────────────────────────
 def extrair_texto_pdf(caminho):
     texto = ""
     try:
@@ -140,7 +150,6 @@ def extrair_texto_pdf(caminho):
                     texto += t + "\n"
     except Exception as e:
         print(f"[pdfplumber] Erro: {e}")
-
     if not texto.strip():
         texto = ocr_pdf(caminho)
     return texto
@@ -172,35 +181,31 @@ def parsear_campos_regex(texto):
     """Fallback: extrai campos por regex quando a IA falha."""
     resultado = {"nome": None, "grupo_cota": None, "modelo": None, "cor": None}
 
-    # Grupo/Cota: padrão NNNNN-NNN-N-N no topo do documento
     cota = re.search(r'\b(\d{4,5}-\d{2,3}-\d-\d)\b', texto)
     if cota:
         resultado["grupo_cota"] = cota.group(1)
 
-    # Nome completo logo após "Nome Completo"
     nome = re.search(
         r'Nome\s+Completo[:\s]+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇ][A-ZÁÉÍÓÚÂÊÎÔÛÃÕÀÈÌÒÙÇa-záéíóúâêîôûãõàèìòùç\s]{5,70}?)(?:\s{2,}|\n|CPF|Data|Tipo)',
-        texto, re.IGNORECASE
+        texto,
+        re.IGNORECASE,
     )
     if nome:
         n = re.sub(r'\s+', ' ', nome.group(1)).strip()
         if len(n.split()) >= 2:
             resultado["nome"] = n
 
-    # Modelo — procura padrões Honda comuns
     modelos = ['CG 160','CG160','NXR','BIZ','PCX','CB 300','CB300','XRE','LEAD','POP','FAN','BROS','TWISTER','TITAN','DREAM','CB 500','START','SHINE']
     for mod in modelos:
         m = re.search(rf'{re.escape(mod)}[\s\w]{{0,20}}', texto, re.IGNORECASE)
         if m:
             resultado["modelo"] = re.sub(r'\s+', ' ', m.group(0)).strip().rstrip('.,;')
             break
-
     if resultado["modelo"]:
         modelo = re.sub(r'\s+\d+[\.,]?\d*\s*%?$', '', resultado["modelo"]).strip()
         modelo = re.sub(r'\s+[A-Z]$', '', modelo).strip()
         resultado["modelo"] = modelo
 
-    # Cor
     cores = ['BRANCA?','PRETA?','VERMELH[AO]','AZUL','PRATA','CINZA','AMARELA?','VERDE','LARANJA','VINHO','GRAFITE','MARROM']
     cor = re.search(r'\b(' + '|'.join(cores) + r')\b', texto, re.IGNORECASE)
     if cor:
@@ -209,12 +214,11 @@ def parsear_campos_regex(texto):
     return resultado
 
 
-# ─── GEMINI ────────────────────────────────────────────────
+# ─── GEMINI ──────────────────────────────────────────────────────────────────
 def extrair_com_gemini(caminho, ext):
     api_key = os.environ.get('GEMINI_API_KEY', '').strip()
     if not api_key:
         raise ValueError("GEMINI_API_KEY não configurada no servidor.")
-
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-1.5-flash')
 
@@ -223,57 +227,39 @@ def extrair_com_gemini(caminho, ext):
 
     mime = 'application/pdf' if ext == '.pdf' else f'image/{ext.lstrip(".")}'
 
-    # Prompt detalhado baseado no formato real do documento Honda
     prompt = """Este é um documento "CADASTRO DE PESSOA FÍSICA - CONSORCIADO" da Honda Consórcio.
-
 Extraia EXATAMENTE os seguintes campos:
-
-1. "nome": O nome completo do consorciado. Está no campo "Nome Completo:" na seção INFORMAÇÕES PESSOAIS. Exemplo: "LORRAYNE DRIELLY CAMPOS MARTINS"
-
-2. "grupo_cota": O código do grupo/cota. Está logo abaixo do título "CADASTRO DE PESSOA FÍSICA - CONSORCIADO", no formato NNNNN-NNN-N-N. Exemplo: "43460-563-0-0"
-
-3. "modelo": O modelo da moto. Está na tabela "TERMO DE COMPROMISSO" na coluna "Modelo". Também pode aparecer no campo "Bem base plano" com asterisco. Exemplo: "CG 160 TITAN S"
-
-4. "cor": A cor da moto. Está na tabela "TERMO DE COMPROMISSO" na coluna "Cor". Exemplo: "BRANCA"
-
-Retorne SOMENTE este JSON, sem texto antes ou depois, sem markdown:
+1. "nome": Nome completo do consorciado (campo "Nome Completo:")
+2. "grupo_cota": Código no formato NNNNN-NNN-N-N (ex: "43460-563-0-0")
+3. "modelo": Modelo da moto na tabela "TERMO DE COMPROMISSO" (ex: "CG 160 TITAN S")
+4. "cor": Cor da moto na tabela "TERMO DE COMPROMISSO" (ex: "BRANCA")
+Retorne SOMENTE este JSON, sem texto adicional:
 {"nome": "...", "grupo_cota": "...", "modelo": "...", "cor": "..."}
-
 Se algum campo não for encontrado, use null."""
 
     resposta = model.generate_content([
-        {
-            "inline_data": {
-                "mime_type": mime,
-                "data": base64.b64encode(dados_arquivo).decode()
-            }
-        },
-        prompt
+        {"inline_data": {"mime_type": mime, "data": base64.b64encode(dados_arquivo).decode()}},
+        prompt,
     ])
 
     txt = resposta.text.strip()
     print(f"[Gemini raw] {txt}")
-
-    # Remove possíveis marcações de markdown
     txt = re.sub(r'```(?:json)?', '', txt).strip().rstrip('`').strip()
-
-    # Extrai apenas o objeto JSON
     match = re.search(r'\{.*\}', txt, re.DOTALL)
     if match:
         txt = match.group(0)
-
     return json.loads(txt)
 
 
-# ─── ROTAS ─────────────────────────────────────────────────
+# ─── ROTAS ───────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     api_key = os.environ.get('GEMINI_API_KEY', '')
     return jsonify({
         "status": "ok",
-        "gemini_key_configurada": bool(api_key),
+        "gemini_configurado": bool(api_key),
         "banco": "postgres" if _usar_postgres else "json",
-        "versao": "4.0"
+        "versao": "5.0",
     })
 
 
@@ -281,7 +267,6 @@ def health():
 def extrair():
     if 'arquivo' not in request.files:
         return jsonify({"erro": "Nenhum arquivo enviado. Use o campo 'arquivo'."}), 400
-
     arquivo = request.files['arquivo']
     if not arquivo.filename:
         return jsonify({"erro": "Nome de arquivo inválido."}), 400
@@ -296,27 +281,15 @@ def extrair():
 
     resultado = {}
     metodo = "gemini"
-
     try:
-        # Tenta com Gemini (IA)
         resultado = extrair_com_gemini(caminho, ext)
         print(f"[Gemini OK] {resultado}")
-
     except ValueError as ve:
-        # Chave não configurada
         print(f"[Gemini] {ve} — fallback regex")
         metodo = "regex"
         texto = extrair_texto_pdf(str(caminho)) if ext == '.pdf' else ocr_imagem(str(caminho))
         resultado = parsear_campos_regex(texto)
-
-    except json.JSONDecodeError as je:
-        # Gemini retornou JSON malformado — tenta regex
-        print(f"[Gemini] JSON inválido: {je} — fallback regex")
-        metodo = "regex"
-        texto = extrair_texto_pdf(str(caminho)) if ext == '.pdf' else ocr_imagem(str(caminho))
-        resultado = parsear_campos_regex(texto)
-
-    except Exception as e:
+    except (json.JSONDecodeError, Exception) as e:
         print(f"[Gemini] Erro: {type(e).__name__}: {e} — fallback regex")
         metodo = "regex"
         try:
@@ -325,22 +298,19 @@ def extrair():
         except Exception as e2:
             print(f"[Fallback] Também falhou: {e2}")
             resultado = {"nome": None, "grupo_cota": None, "modelo": None, "cor": None}
-
     finally:
         if caminho.exists():
             caminho.unlink()
 
-    # Limpa valores "null" string
     for k in resultado:
         if resultado[k] in (None, 'null', 'None', ''):
             resultado[k] = None
-
     resultado["_metodo"] = metodo
     print(f"[Resultado final] metodo={metodo} dados={resultado}")
     return jsonify(resultado)
 
 
-# ─── CLIENTES CRUD ─────────────────────────────────────────
+# ─── CLIENTES CRUD ────────────────────────────────────────────────────────────
 @app.route('/clientes', methods=['GET'])
 def listar_clientes():
     return jsonify(carregar_clientes())
@@ -353,23 +323,21 @@ def adicionar_cliente():
         return jsonify({"erro": "Corpo da requisição inválido"}), 400
 
     cliente = {
-        "id":                str(uuid.uuid4()),
-        "nome":              dados.get("nome", "—"),
-        "grupo_cota":        dados.get("grupo_cota", "—"),
-        "modelo":            dados.get("modelo", "—"),
-        "cor":               dados.get("cor", "—"),
-        "status":            dados.get("status", "Aguardando Contemplação"),
-        "data_entrada":      dados.get("data_entrada", "—"),
+        "id": str(uuid.uuid4()),
+        "nome": dados.get("nome", "—"),
+        "grupo_cota": dados.get("grupo_cota", "—"),
+        "modelo": dados.get("modelo", "—"),
+        "cor": dados.get("cor", "—"),
+        "status": dados.get("status", "Aguardando Contemplação"),
+        "data_entrada": dados.get("data_entrada", "—"),
         "data_contemplacao": dados.get("data_contemplacao", "—"),
-        "criado_em":         datetime.now().strftime("%d/%m/%Y"),
+        "criado_em": datetime.now().strftime("%d/%m/%Y"),
     }
 
     if _usar_postgres:
         try:
             conn = _get_conn()
             cur = conn.cursor()
-
-            # Validação de duplicata por grupo_cota
             gc = cliente["grupo_cota"]
             if gc and gc != "—":
                 cur.execute("SELECT id FROM clientes WHERE grupo_cota = %s", (gc,))
@@ -377,12 +345,11 @@ def adicionar_cliente():
                     cur.close()
                     conn.close()
                     return jsonify({"erro": "Cliente com este Grupo/Cota já está cadastrado", "duplicado": True}), 409
-
             cur.execute(
-                "INSERT INTO clientes (id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO clientes (id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (cliente["id"], cliente["nome"], cliente["grupo_cota"], cliente["modelo"],
                  cliente["cor"], cliente["status"], cliente["data_entrada"],
-                 cliente["data_contemplacao"], cliente["criado_em"])
+                 cliente["data_contemplacao"], cliente["criado_em"]),
             )
             _registrar_historico(conn, cliente["id"], "ADICIONADO", dados_novos=cliente)
             conn.commit()
@@ -392,7 +359,6 @@ def adicionar_cliente():
             print(f"[DB] Erro ao adicionar cliente: {e}")
             return jsonify({"erro": "Erro interno ao salvar cliente"}), 500
     else:
-        # Fallback JSON
         clientes = carregar_clientes()
         gc = cliente["grupo_cota"]
         if gc and gc != "—":
@@ -410,27 +376,32 @@ def editar_cliente(id):
     if not dados:
         return jsonify({"erro": "Corpo da requisição inválido"}), 400
 
+    # Filtra apenas campos permitidos para evitar injeção de campos arbitrários
+    campos = {k: v for k, v in dados.items() if k in CAMPOS_PERMITIDOS}
+    if not campos:
+        return jsonify({"erro": "Nenhum campo válido para atualizar"}), 400
+
     if _usar_postgres:
         try:
             conn = _get_conn()
             cur = conn.cursor()
-
-            # Busca estado anterior para histórico
-            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            cur.execute(
+                "SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s",
+                (id,),
+            )
             row = cur.fetchone()
             anterior = _row_to_dict(row) if row else None
 
-            campos = {k: v for k, v in dados.items() if k != "id"}
-            if campos:
-                sets = ", ".join(f"{k} = %s" for k in campos)
-                valores = list(campos.values()) + [id]
-                cur.execute(f"UPDATE clientes SET {sets} WHERE id = %s", valores)
+            sets = ", ".join(f"{k} = %s" for k in campos)
+            valores = list(campos.values()) + [id]
+            cur.execute(f"UPDATE clientes SET {sets} WHERE id = %s", valores)
 
-            # Busca estado novo para histórico
-            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            cur.execute(
+                "SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s",
+                (id,),
+            )
             row_novo = cur.fetchone()
             novo = _row_to_dict(row_novo) if row_novo else None
-
             _registrar_historico(conn, id, "EDITADO", dados_anteriores=anterior, dados_novos=novo)
             conn.commit()
             cur.close()
@@ -442,9 +413,8 @@ def editar_cliente(id):
         clientes = carregar_clientes()
         for c in clientes:
             if c["id"] == id:
-                for k, v in dados.items():
-                    if k != "id":
-                        c[k] = v
+                for k, v in campos.items():
+                    c[k] = v
                 break
         salvar_clientes(clientes)
 
@@ -457,11 +427,12 @@ def remover_cliente(id):
         try:
             conn = _get_conn()
             cur = conn.cursor()
-
-            cur.execute("SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s", (id,))
+            cur.execute(
+                "SELECT id, nome, grupo_cota, modelo, cor, status, data_entrada, data_contemplacao, criado_em FROM clientes WHERE id = %s",
+                (id,),
+            )
             row = cur.fetchone()
             anterior = _row_to_dict(row) if row else None
-
             cur.execute("DELETE FROM clientes WHERE id = %s", (id,))
             _registrar_historico(conn, id, "REMOVIDO", dados_anteriores=anterior)
             conn.commit()
@@ -477,7 +448,7 @@ def remover_cliente(id):
     return jsonify({"ok": True})
 
 
-# ─── HISTÓRICO ──────────────────────────────────────────────
+# ─── HISTÓRICO ────────────────────────────────────────────────────────────────
 @app.route('/historico', methods=['GET'])
 def listar_historico():
     if not _usar_postgres:
@@ -491,37 +462,26 @@ def listar_historico():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        resultado = []
-        for r in rows:
-            resultado.append({
-                "id":               r[0],
-                "cliente_id":       r[1],
-                "acao":             r[2],
-                "dados_anteriores": json.loads(r[3]) if r[3] else None,
-                "dados_novos":      json.loads(r[4]) if r[4] else None,
-                "data_hora":        r[5],
-            })
-        return jsonify(resultado)
+        return jsonify([{
+            "id": r[0],
+            "cliente_id": r[1],
+            "acao": r[2],
+            "dados_anteriores": json.loads(r[3]) if r[3] else None,
+            "dados_novos": json.loads(r[4]) if r[4] else None,
+            "data_hora": r[5],
+        } for r in rows])
     except Exception as e:
         print(f"[DB] Erro ao carregar histórico: {e}")
         return jsonify({"erro": "Erro ao carregar histórico"}), 500
 
 
-# ─── ESTOQUE ────────────────────────────────────────────────
+# ─── ESTOQUE ──────────────────────────────────────────────────────────────────
 @app.route('/estoque', methods=['GET'])
 def get_estoque():
     if _usar_postgres:
         try:
             conn = _get_conn()
             cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS estoque (
-                    id INTEGER DEFAULT 1,
-                    dados TEXT,
-                    PRIMARY KEY (id)
-                )
-            """)
-            conn.commit()
             cur.execute("SELECT dados FROM estoque WHERE id = 1")
             row = cur.fetchone()
             cur.close()
@@ -541,24 +501,16 @@ def get_estoque():
 def save_estoque():
     dados = request.get_json()
     if not dados or "estoque" not in dados:
-        return jsonify({"erro": "Corpo inválido, esperado {\"estoque\": {...}}"}), 400
+        return jsonify({"erro": 'Corpo inválido, esperado {"estoque": {...}}'}), 400
 
     estoque = dados["estoque"]
-
     if _usar_postgres:
         try:
             conn = _get_conn()
             cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS estoque (
-                    id INTEGER DEFAULT 1,
-                    dados TEXT,
-                    PRIMARY KEY (id)
-                )
-            """)
             cur.execute(
                 "INSERT INTO estoque (id, dados) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET dados = EXCLUDED.dados",
-                (json.dumps(estoque, ensure_ascii=False),)
+                (json.dumps(estoque, ensure_ascii=False),),
             )
             conn.commit()
             cur.close()
